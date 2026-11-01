@@ -1,0 +1,15 @@
+# 环境与密钥
+.env
+.env.*
+!.env.example
+# 依赖与构建
+node_modules/
+dist/
+# 真实业务数据（一律不进库）
+export/
+data/
+uploads/
+*.sql
+*.dump
+*.log
+.DS_Store
