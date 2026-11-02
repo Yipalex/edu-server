@@ -158,7 +158,7 @@ export function registerAuthRoutes(app, fastify) {
 }
 
 /** 要求超级管理员，否则抛 403 */
-function requireSuperAdmin(req, app) {
+export function requireSuperAdmin(req, app) {
   const user = requireAuth(req, app);
   if (user.role !== 'superadmin') throw new HttpError(403, '仅超级管理员可执行此操作');
   return user;

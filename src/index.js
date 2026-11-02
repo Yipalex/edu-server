@@ -8,6 +8,7 @@ import { registerDbRoutes } from './dbroutes.js';
 import { registerStorageRoutes } from './storage.js';
 import { registerLlmRoutes } from './llm.js';
 import { registerSfReportRoutes } from './sfreport.js';
+import { registerWmsSyncRoutes, startWmsAutoSync } from './wmssync.js';
 import { errorBody } from './util.js';
 import { closePools } from './db.js';
 
@@ -60,6 +61,10 @@ registerLlmRoutes(fastify);
 
 // sf 评测报告上传（静态站，共享密钥认证，非 JWT）
 registerSfReportRoutes(fastify);
+
+// WMS → yj 物品名录同步（手动按钮 + 每 10 分钟自动，超管专属手动触发）
+registerWmsSyncRoutes(fastify);
+startWmsAutoSync(fastify);
 
 const shutdown = async () => {
   await fastify.close();
