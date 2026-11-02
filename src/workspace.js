@@ -87,4 +87,156 @@ export function registerWorkspaceRoutes(fastify) {
     const mine = cfg.perUser[me.id] !== undefined ? Number(cfg.perUser[me.id]) : cfg.default;
     return { target: mine, default: cfg.default };
   });
+
+  /* ========== 工作台首页统计（个人聚合，跨人比较只回名次不回他人明细） ========== */
+  async function myName(me) {
+    const r = await pool().query('SELECT name FROM profiles WHERE owner_id = $1 LIMIT 1', [me.id]);
+    if (r.rows[0] && r.rows[0].name) return r.rows[0].name;
+    const u = await pool().query('SELECT name FROM users WHERE id = $1 LIMIT 1', [me.id]);
+    return (u.rows[0] && u.rows[0].name) || '';
+  }
+  const curMonth = () => new Date().toISOString().slice(0, 7);
+
+  fastify.get('/api/yj/my-stats', async (req, reply) => {
+    const me = requireAuth(req, 'yj');
+    const name = await myName(me);
+    const month = (req.query && String(req.query.month || '').match(/^\d{4}-\d{2}$/)) ? req.query.month : curMonth();
+
+    const P = () => pool();
+    const [amount, orders, hours, invites] = await Promise.all([
+      P().query(
+        `SELECT COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS v FROM records
+         WHERE type='tuition' AND status='accounted' AND month=$1 AND payload->>'commission_to'=$2`,
+        [month, name]
+      ),
+      P().query(
+        `SELECT COUNT(*)::int AS v FROM records
+         WHERE type='tuition' AND month=$1 AND payload->>'commission_to'=$2`,
+        [month, name]
+      ),
+      P().query(
+        `SELECT COUNT(*)::int AS v FROM records
+         WHERE type='course' AND month=$1 AND owner_name=$2`,
+        [month, name]
+      ),
+      P().query(
+        `SELECT COUNT(*)::int AS v FROM records
+         WHERE type='invite' AND month=$1 AND owner_name=$2`,
+        [month, name]
+      ),
+    ]);
+
+    // 近 6 个月业绩趋势（已核算学费，按跟进老师归属）
+    const trendRows = await P().query(
+      `SELECT month, COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS v FROM records
+       WHERE type='tuition' AND status='accounted' AND payload->>'commission_to'=$1
+         AND month >= to_char(date_trunc('month', $2::date) - interval '5 months', 'YYYY-MM')
+         AND month <= to_char($2::date, 'YYYY-MM')
+       GROUP BY month ORDER BY month`,
+      [name, month + '-01']
+    );
+    const trend = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(month + '-01T00:00:00Z');
+      d.setUTCMonth(d.getUTCMonth() - i);
+      const m = d.toISOString().slice(0, 7);
+      const row = trendRows.rows.find((r) => r.month === m);
+      trend.push({ month: m, amount: row ? row.v : 0 });
+    }
+
+    // 全校名次：本月已核算业绩金额排名（只回本人名次与总人数）
+    const rankRows = await P().query(
+      `SELECT payload->>'commission_to' AS name, COALESCE(SUM((payload->>'amount')::numeric),0) AS v
+       FROM records WHERE type='tuition' AND status='accounted' AND month=$1
+         AND payload->>'commission_to' IS NOT NULL AND payload->>'commission_to' <> ''
+       GROUP BY 1 ORDER BY v DESC`,
+      [month]
+    );
+    const rankIdx = rankRows.rows.findIndex((r) => r.name === name);
+    const rank = rankIdx >= 0 ? rankIdx + 1 : null;
+    const rankTotal = rankRows.rows.length;
+
+    // 徽章（服务端算好，只回获得标记；并列第一均可获得）
+    const ordRows = await P().query(
+      `SELECT payload->>'commission_to' AS name, COUNT(*)::int AS n FROM records
+       WHERE type='tuition' AND month=$1 AND payload->>'commission_to' IS NOT NULL AND payload->>'commission_to' <> ''
+       GROUP BY 1 ORDER BY n DESC`, [month]);
+    const invRows = await P().query(
+      `SELECT owner_name AS name, COUNT(*)::int AS n FROM records
+       WHERE type='invite' AND month=$1 AND owner_name IS NOT NULL AND owner_name <> ''
+       GROUP BY 1 ORDER BY n DESC`, [month]);
+    const topN = (rows) => (rows.length && rows[0].n > 0 ? rows[0].n : 0);
+    const myN = (rows) => { const r = rows.find((x) => x.name === name); return r ? r.n : 0; };
+    // 满勤之星：本月至今日每天都有登记记录，且本月已过 >=10 天
+    const days = await P().query(
+      `SELECT COUNT(DISTINCT created_at::date)::int AS n FROM records
+       WHERE owner_name=$1 AND created_at >= date_trunc('month', now()) AND created_at < now() + interval '1 day'`,
+      [name]);
+    const elapsed = new Date().getDate(); // 本月已过的天数（服务器时区）
+    const fullAtt = elapsed >= 10 && days.rows[0] && days.rows[0].n >= elapsed;
+
+    return {
+      month, name,
+      amount: amount.rows[0].v, orders: orders.rows[0].v,
+      hours: hours.rows[0].v, invites: invites.rows[0].v,
+      trend, rank, rankTotal,
+      badges: {
+        order_king: myN(ordRows.rows) > 0 && myN(ordRows.rows) === topN(ordRows.rows),
+        invite_star: myN(invRows.rows) > 0 && myN(invRows.rows) === topN(invRows.rows),
+        full_att: !!fullAtt,
+      },
+    };
+  });
+
+  /* ========== 业绩榜单（角色定界：教师仅本人+名次；超管/财务见 TOP 榜） ========== */
+  fastify.get('/api/yj/rank', async (req, reply) => {
+    const me = requireAuth(req, 'yj');
+    const month = (req.query && String(req.query.month || '').match(/^\d{4}-\d{2}$/)) ? req.query.month : curMonth();
+    const isMgr = me.role === 'superadmin' || me.role === 'finance';
+    const name = await myName(me);
+
+    const mine = await pool().query(
+      `SELECT COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS amount, COUNT(*)::int AS orders
+       FROM records WHERE type='tuition' AND status='accounted' AND month=$1 AND payload->>'commission_to'=$2`,
+      [month, name]);
+    const rankRows = await pool().query(
+      `SELECT payload->>'commission_to' AS name, COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS amount, COUNT(*)::int AS orders
+       FROM records WHERE type='tuition' AND status='accounted' AND month=$1
+         AND payload->>'commission_to' IS NOT NULL AND payload->>'commission_to' <> ''
+       GROUP BY 1 ORDER BY amount DESC`, [month]);
+    const idx = rankRows.rows.findIndex((r) => r.name === name);
+    const out = {
+      month,
+      self: { name, amount: mine.rows[0].amount, orders: mine.rows[0].orders, rank: idx >= 0 ? idx + 1 : null, total: rankRows.rows.length },
+    };
+    if (isMgr) out.top = rankRows.rows.slice(0, 10); // 管理角色可见榜单纯金额/单数（校区维度后续阶段补）
+    return out;
+  });
+
+  /* ========== 六系统切换（权限判定 + SSO 标记） ========== */
+  const SYSTEMS = [
+    { key: 'yj',   name: '业绩登记系统', desc: '课时 · 学费 · 物品 · 邀约', url: 'https://yj.example.com/',   sso: true },
+    { key: 'quan', name: '券类管理系统', desc: '优惠券发放与核销',          url: 'https://quan.example.com/',  sso: true },
+    { key: 'jz',   name: '教资报名系统', desc: '教资报名与课时',            url: 'https://jz.example.com/',    sso: true },
+    { key: 'sf',   name: '评测报告系统', desc: '学员书写评测报告生成',      url: 'https://sf.example.com/',    sso: false },
+    { key: 'wms',  name: '仓库管理系统', desc: '物品档案 · 出入库 · 盘点',  url: 'https://wms.example.com/',   sso: false },
+    { key: 'zc',   name: '固定资产管理', desc: '资产台账与领用',            url: 'https://zc.example.com/',    sso: false },
+  ];
+  fastify.get('/api/yj/systems', async (req, reply) => {
+    const me = requireAuth(req, 'yj');
+    const out = [];
+    for (const s of SYSTEMS) {
+      let access = 'granted'; // granted | denied | login（独立登录，直达其登录页）
+      if (s.key === 'quan' || s.key === 'jz') {
+        try {
+          const r = await getPool(s.key).query('SELECT active FROM users WHERE phone=$1 LIMIT 1', [me.phone]);
+          access = r.rows[0] && r.rows[0].active ? 'granted' : 'denied';
+        } catch { access = 'denied'; }
+      } else if (s.key === 'zc' || s.key === 'wms') {
+        access = 'login';
+      }
+      out.push({ ...s, access });
+    }
+    return { systems: out };
+  });
 }
