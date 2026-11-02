@@ -3,6 +3,7 @@ import { getPool, getFunctionSigs, resolveOverload } from './db.js';
 import { getAuthUser } from './auth.js';
 import { authorize, loadYjRole, isYjStaffRole } from './policies.js';
 import { isIdent } from './util.js';
+import { onRecordsStatusChange } from './xibao.js';
 
 const OPS = {
   eq: (c, p) => `${c} = ${p}`,
@@ -286,6 +287,15 @@ export function registerDbRoutes(fastify) {
         recordId: pickRecordId(filters) || pickRecordId(r.rows && r.rows[0]),
         detail: { set, before },
       });
+      /* 记录状态变更钩子（喜报推送/退回消息）：仅 yj records，fire-and-forget，异常已在钩子内兜住。
+         注意：必须单独组装查询参数 —— values 已按 SET 子句占用占位符，复用会错位 */
+      if (app === 'yj' && table === 'records' && set.status !== undefined) {
+        const selValues = [];
+        const selWhere = buildWhere([...(authz.filters || []), ...filters], selValues, 1);
+        getPool(app).query(`SELECT * FROM ${table}${selWhere.sql} LIMIT 50`, selValues)
+          .then((sel) => onRecordsStatusChange(app, req, { set, before, afterRows: sel.rows || [] }))
+          .catch(() => {});
+      }
       return returning ? r.rows : null;
     } catch (e) {
       return { error: { message: e.message } };

@@ -9,6 +9,7 @@ import { registerStorageRoutes } from './storage.js';
 import { registerLlmRoutes } from './llm.js';
 import { registerSfReportRoutes } from './sfreport.js';
 import { registerWmsSyncRoutes, startWmsAutoSync } from './wmssync.js';
+import { registerWorkspaceRoutes } from './workspace.js';
 import { errorBody } from './util.js';
 import { closePools } from './db.js';
 
@@ -65,6 +66,9 @@ registerSfReportRoutes(fastify);
 // WMS → yj 物品名录同步（手动按钮 + 每 10 分钟自动，超管专属手动触发）
 registerWmsSyncRoutes(fastify);
 startWmsAutoSync(fastify);
+
+// 工作台支撑：教师名单 / 消息中心 / 月度目标配置（仅 yj）
+registerWorkspaceRoutes(fastify);
 
 const shutdown = async () => {
   await fastify.close();
