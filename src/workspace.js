@@ -106,7 +106,7 @@ export function registerWorkspaceRoutes(fastify) {
     const [amount, orders, hours, invites] = await Promise.all([
       P().query(
         `SELECT COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS v FROM records
-         WHERE type='tuition' AND status='accounted' AND month=$1 AND payload->>'commission_to'=$2`,
+         WHERE type='tuition' AND status IN ('pending','accounted') AND month=$1 AND payload->>'commission_to'=$2`,
         [month, name]
       ),
       P().query(
@@ -129,7 +129,7 @@ export function registerWorkspaceRoutes(fastify) {
     // 近 6 个月业绩趋势（已核算学费，按跟进老师归属）
     const trendRows = await P().query(
       `SELECT month, COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS v FROM records
-       WHERE type='tuition' AND status='accounted' AND payload->>'commission_to'=$1
+       WHERE type='tuition' AND status IN ('pending','accounted') AND payload->>'commission_to'=$1
          AND month >= to_char(date_trunc('month', $2::date) - interval '5 months', 'YYYY-MM')
          AND month <= to_char($2::date, 'YYYY-MM')
        GROUP BY month ORDER BY month`,
@@ -147,7 +147,7 @@ export function registerWorkspaceRoutes(fastify) {
     // 全校名次：本月已核算业绩金额排名（只回本人名次与总人数）
     const rankRows = await P().query(
       `SELECT payload->>'commission_to' AS name, COALESCE(SUM((payload->>'amount')::numeric),0) AS v
-       FROM records WHERE type='tuition' AND status='accounted' AND month=$1
+       FROM records WHERE type='tuition' AND status IN ('pending','accounted') AND month=$1
          AND payload->>'commission_to' IS NOT NULL AND payload->>'commission_to' <> ''
        GROUP BY 1 ORDER BY v DESC`,
       [month]
@@ -188,28 +188,72 @@ export function registerWorkspaceRoutes(fastify) {
     };
   });
 
-  /* ========== 业绩榜单（角色定界：教师仅本人+名次；超管/财务见 TOP 榜） ========== */
+  /* ========== 业绩榜单（角色定界：教师仅本人+名次，避免攀比；校长看本校区；超管/财务看全校+校区汇总） ========== */
+  /* profiles.campus（城东校区/城西校区…）与 records.campus（城东校区/城西校区…）口径不一致，需别名映射 */
+  const CAMPUS_ALIAS = { '城东校区': '城东校区', '城西校区': '城西校区', '海东': '城南校区', '麻章': '城北校区', '开发区': '高新区校区' };
+  async function myCampus(me) {
+    const r = await pool().query('SELECT campus FROM profiles WHERE owner_id = $1 LIMIT 1', [me.id]);
+    const c = (r.rows[0] && r.rows[0].campus) || '';
+    if (!c) return '';
+    if (c.includes('校区')) return c;
+    return CAMPUS_ALIAS[c] || c + '校区';
+  }
+  // 校区汇总：该校区已核算学费总额/单数 + 课时节数
+  async function campusSummary(campus, month) {
+    const r = await pool().query(
+      `SELECT COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS amount, COUNT(*)::int AS orders
+       FROM records WHERE type='tuition' AND status IN ('pending','accounted') AND month=$1 AND campus=$2`,
+      [month, campus]);
+    const h = await pool().query(
+      `SELECT COUNT(*)::int AS n FROM records WHERE type='course' AND month=$1 AND campus=$2`,
+      [month, campus]);
+    return { campus, amount: r.rows[0].amount, orders: r.rows[0].orders, hours: h.rows[0].n };
+  }
+
   fastify.get('/api/yj/rank', async (req, reply) => {
     const me = requireAuth(req, 'yj');
     const month = (req.query && String(req.query.month || '').match(/^\d{4}-\d{2}$/)) ? req.query.month : curMonth();
-    const isMgr = me.role === 'superadmin' || me.role === 'finance';
+    const isSuperMgr = me.role === 'superadmin' || me.role === 'finance';
+    const isPrincipal = me.role === 'principal';
     const name = await myName(me);
 
     const mine = await pool().query(
       `SELECT COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS amount, COUNT(*)::int AS orders
-       FROM records WHERE type='tuition' AND status='accounted' AND month=$1 AND payload->>'commission_to'=$2`,
+       FROM records WHERE type='tuition' AND status IN ('pending','accounted') AND month=$1 AND payload->>'commission_to'=$2`,
       [month, name]);
     const rankRows = await pool().query(
       `SELECT payload->>'commission_to' AS name, COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS amount, COUNT(*)::int AS orders
-       FROM records WHERE type='tuition' AND status='accounted' AND month=$1
+       FROM records WHERE type='tuition' AND status IN ('pending','accounted') AND month=$1
          AND payload->>'commission_to' IS NOT NULL AND payload->>'commission_to' <> ''
        GROUP BY 1 ORDER BY amount DESC`, [month]);
     const idx = rankRows.rows.findIndex((r) => r.name === name);
     const out = {
       month,
+      role: isSuperMgr ? 'manager' : (isPrincipal ? 'principal' : 'teacher'),
       self: { name, amount: mine.rows[0].amount, orders: mine.rows[0].orders, rank: idx >= 0 ? idx + 1 : null, total: rankRows.rows.length },
     };
-    if (isMgr) out.top = rankRows.rows.slice(0, 10); // 管理角色可见榜单纯金额/单数（校区维度后续阶段补）
+    if (isSuperMgr) {
+      out.top = rankRows.rows.slice(0, 10);
+      const cs = await pool().query(
+        `SELECT campus, COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS amount, COUNT(*)::int AS orders
+         FROM records WHERE type='tuition' AND status IN ('pending','accounted') AND month=$1 AND campus IS NOT NULL AND campus <> ''
+         GROUP BY campus ORDER BY amount DESC`, [month]);
+      const hs = await pool().query(
+        `SELECT campus, COUNT(*)::int AS n FROM records
+         WHERE type='course' AND month=$1 AND campus IS NOT NULL AND campus <> '' GROUP BY campus`, [month]);
+      out.campusSummary = cs.rows.map((c) => ({ ...c, hours: (hs.rows.find((x) => x.campus === c.campus) || {}).n || 0 }));
+    } else if (isPrincipal) {
+      const campus = await myCampus(me);
+      out.campus = campus;
+      if (campus) {
+        out.campusSummary = [await campusSummary(campus, month)];
+        out.campusRank = await pool().query(
+          `SELECT payload->>'commission_to' AS name, COALESCE(SUM((payload->>'amount')::numeric),0)::float8 AS amount, COUNT(*)::int AS orders
+           FROM records WHERE type='tuition' AND status IN ('pending','accounted') AND month=$1 AND campus=$2
+             AND payload->>'commission_to' IS NOT NULL AND payload->>'commission_to' <> ''
+           GROUP BY 1 ORDER BY amount DESC`, [month, campus]).then((r) => r.rows);
+      }
+    }
     return out;
   });
 
