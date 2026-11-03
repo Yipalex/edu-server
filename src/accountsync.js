@@ -24,7 +24,7 @@ export const SYNC_SYSTEMS = {
   },
   wms: {
     name: '仓库管理系统',
-    roles: [['operator', '操作员'], ['admin', '管理员']],
+    roles: [['operator', '操作员'], ['admin', '管理员'], ['superadmin', '超级管理员']],
   },
   zc: {
     name: '固定资产管理',
@@ -34,7 +34,7 @@ export const SYNC_SYSTEMS = {
 
 // 新开通系统时的默认角色（按 yj 工作台角色映射，超管可再改）
 export const DEFAULT_ROLE_MAP = {
-  superadmin: { quan: 'superadmin', wms: 'admin', zc: 'superadmin' },
+  superadmin: { quan: 'superadmin', wms: 'superadmin', zc: 'superadmin' },
   principal:  { quan: 'admin', wms: 'admin', zc: 'principal' },
   finance:    { quan: 'teacher', wms: 'operator', zc: 'finance' },
   teacher:    { quan: 'teacher', wms: 'operator', zc: 'teacher' },
