@@ -189,8 +189,8 @@ export function registerWorkspaceRoutes(fastify) {
   });
 
   /* ========== 业绩榜单（角色定界：教师仅本人+名次，避免攀比；校长看本校区；超管/财务看全校+校区汇总） ========== */
-  /* profiles.campus（城东校区/城西校区…）与 records.campus（城东校区/城西校区…）口径不一致，需别名映射 */
-  const CAMPUS_ALIAS = { '城东校区': '城东校区', '城西校区': '城西校区', '海东': '城南校区', '麻章': '城北校区', '开发区': '高新区校区' };
+  /* profiles.campus（赤坎金城/霞山社坛…）与 records.campus（金城校区/霞山校区…）口径不一致，需别名映射 */
+  const CAMPUS_ALIAS = { '赤坎金城': '金城校区', '霞山社坛': '霞山校区', '海东': '海东校区', '麻章': '麻章校区', '开发区': '开发区校区' };
   async function myCampus(me) {
     const r = await pool().query('SELECT campus FROM profiles WHERE owner_id = $1 LIMIT 1', [me.id]);
     const c = (r.rows[0] && r.rows[0].campus) || '';
@@ -259,25 +259,43 @@ export function registerWorkspaceRoutes(fastify) {
 
   /* ========== 六系统切换（权限判定 + SSO 标记） ========== */
   const SYSTEMS = [
-    { key: 'yj',   name: '业绩登记系统', desc: '课时 · 学费 · 物品 · 邀约', url: 'https://yj.example.com/',   sso: true },
-    { key: 'quan', name: '券类管理系统', desc: '优惠券发放与核销',          url: 'https://quan.example.com/',  sso: true },
-    { key: 'jz',   name: '教资报名系统', desc: '教资报名与课时',            url: 'https://jz.example.com/',    sso: true },
-    { key: 'sf',   name: '评测报告系统', desc: '学员书写评测报告生成',      url: 'https://sf.example.com/',    sso: false },
-    { key: 'wms',  name: '仓库管理系统', desc: '物品档案 · 出入库 · 盘点',  url: 'https://wms.example.com/',   sso: false },
-    { key: 'zc',   name: '固定资产管理', desc: '资产台账与领用',            url: 'https://zc.example.com/',    sso: false },
+    { key: 'yj',   name: '业绩登记系统', desc: '课时 · 学费 · 物品 · 邀约', url: 'https://yj.zexishuhua.com/',   sso: true },
+    { key: 'quan', name: '券类管理系统', desc: '优惠券发放与核销',          url: 'https://quan.zexishuhua.com/',  sso: true },
+    { key: 'jz',   name: '教资报名系统', desc: '教资报名与课时',            url: 'https://jz.zexishuhua.com/',    sso: true },
+    { key: 'sf',   name: '评测报告系统', desc: '学员书写评测报告生成',      url: 'https://sf.zexishuhua.com/',    sso: false },
+    { key: 'wms',  name: '仓库管理系统', desc: '物品档案 · 出入库 · 盘点',  url: 'https://wms.zexishuhua.com/',   sso: false },
+    { key: 'zc',   name: '固定资产管理', desc: '资产台账与领用',            url: 'https://zc.zexishuhua.com/',    sso: false },
   ];
   fastify.get('/api/yj/systems', async (req, reply) => {
     const me = requireAuth(req, 'yj');
+    // 统一账号体系：可访问范围以 yj users.system_access 为准（超管恒为全系统）
+    // 列尚不存在（迁移前）时 myAccess=null，按旧逻辑放行，避免误伤存量用户
+    let myAccess = null;
+    if (me.role !== 'superadmin') {
+      try {
+        const ur = await pool().query('SELECT system_access FROM users WHERE id = $1', [me.id]);
+        myAccess = ur.rows[0]?.system_access || [];
+      } catch { myAccess = null; }
+    }
     const out = [];
     for (const s of SYSTEMS) {
       let access = 'granted'; // granted | denied | login（独立登录，直达其登录页）
-      if (s.key === 'quan' || s.key === 'jz') {
+      if (s.key === 'quan') {
+        if (myAccess && !myAccess.includes('quan')) {
+          access = 'denied';
+        } else {
+          try {
+            const r = await getPool(s.key).query('SELECT active FROM users WHERE phone=$1 LIMIT 1', [me.phone]);
+            access = r.rows[0] && r.rows[0].active ? 'granted' : 'denied';
+          } catch { access = 'denied'; }
+        }
+      } else if (s.key === 'jz') {
         try {
           const r = await getPool(s.key).query('SELECT active FROM users WHERE phone=$1 LIMIT 1', [me.phone]);
           access = r.rows[0] && r.rows[0].active ? 'granted' : 'denied';
         } catch { access = 'denied'; }
       } else if (s.key === 'zc' || s.key === 'wms') {
-        access = 'login';
+        access = me.role === 'superadmin' || (myAccess && myAccess.includes(s.key)) ? 'login' : 'denied';
       }
       out.push({ ...s, access });
     }

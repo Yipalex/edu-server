@@ -5,6 +5,7 @@ import jwt from 'jsonwebtoken';
 import { config } from './config.js';
 import { getPool } from './db.js';
 import { genId, isPhone, errorBody, HttpError } from './util.js';
+import { ensureCols, getUserAccess, provisionToSystem, syncPasswordHash, syncActive, syncRemoved, SYNC_SYSTEMS, DEFAULT_ROLE_MAP } from './accountsync.js';
 
 export function signToken(user, app) {
   return jwt.sign({ sub: user.id, phone: user.phone, role: user.role || 'user', app }, config.jwtSecret, {
@@ -153,6 +154,13 @@ export function registerAuthRoutes(app, fastify) {
       return reply.code(400).send(errorBody('原密码错误'));
     const hash = await bcrypt.hash(newPassword, config.bcryptRounds);
     await getPool(app).query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, auth.id]);
+    // 统一账号体系：密码变更广播到所有已开通系统（best-effort；主库为 yj，仅 yj 侧改动触发广播）
+    if (app === 'yj') {
+      try {
+        const u = await getUserAccess(auth.id);
+        if (u && (u.system_access || []).length) await syncPasswordHash(u, hash);
+      } catch (e) { req.log.warn('跨系统密码同步失败: %s', e.message); }
+    }
     return { ok: true };
   });
 }
@@ -174,8 +182,9 @@ export function registerAdminRoutes(app, fastify) {
   // 账号列表
   fastify.get(`/api/${app}/admin/users`, async (req) => {
     requireSuperAdmin(req, app);
+    await ensureCols();
     const r = await pool().query(
-      'SELECT id, phone, name, role, active, created_at FROM users ORDER BY created_at DESC'
+      'SELECT id, phone, name, role, active, created_at, system_access, system_roles FROM users ORDER BY created_at DESC'
     );
     return { users: r.rows };
   });
@@ -224,10 +233,66 @@ export function registerAdminRoutes(app, fastify) {
     const { password } = req.body || {};
     if (typeof password !== 'string' || password.length < 6)
       return reply.code(400).send(errorBody('新密码至少 6 位'));
+    const hash = await bcrypt.hash(password, config.bcryptRounds);
     const r = await pool().query('UPDATE users SET password_hash = $1 WHERE id = $2',
-      [await bcrypt.hash(password, config.bcryptRounds), req.params.id]);
+      [hash, req.params.id]);
     if (r.rowCount === 0) return reply.code(404).send(errorBody('账号不存在'));
+    try {
+      const u = await getUserAccess(req.params.id);
+      if (u && (u.system_access || []).length) await syncPasswordHash(u, hash);
+    } catch (e) { req.log.warn('跨系统密码同步失败: %s', e.message); }
     return { ok: true };
+  });
+
+  // 读取某账号的系统开通情况
+  fastify.get(`/api/${app}/admin/users/:id/access`, async (req, reply) => {
+    requireSuperAdmin(req, app);
+    const u = await getUserAccess(String(req.params.id));
+    if (!u) return reply.code(404).send(errorBody('账号不存在'));
+    return {
+      access: u.system_access || [],
+      roles: u.system_roles || {},
+      defaults: DEFAULT_ROLE_MAP[u.role] || DEFAULT_ROLE_MAP.teacher,
+      systems: SYNC_SYSTEMS,
+    };
+  });
+
+  // 设置某账号可访问的系统与各系统角色（勾选即开通影子账号，取消即停用，均不删数据）
+  fastify.put(`/api/${app}/admin/users/:id/access`, async (req, reply) => {
+    requireSuperAdmin(req, app);
+    const id = String(req.params.id);
+    const { access, roles } = req.body || {};
+    if (!Array.isArray(access)) return reply.code(400).send(errorBody('access 必须是数组'));
+    const bad = access.filter((s) => !SYNC_SYSTEMS[s]);
+    if (bad.length) return reply.code(400).send(errorBody('未知系统: ' + bad.join(',')));
+    const cleanRoles = {};
+    for (const s of access) {
+      const wanted = roles?.[s];
+      const valid = SYNC_SYSTEMS[s].roles.some(([k]) => k === wanted);
+      cleanRoles[s] = valid ? wanted : (DEFAULT_ROLE_MAP.teacher[s] || SYNC_SYSTEMS[s].roles[0][0]);
+    }
+    const u = await getUserAccess(id);
+    if (!u) return reply.code(404).send(errorBody('账号不存在'));
+
+    const prev = u.system_access || [];
+    await pool().query(
+      'UPDATE users SET system_access = $1, system_roles = $2 WHERE id = $3',
+      [access, JSON.stringify(cleanRoles), id]);
+
+    // 新开通 → provision；角色变化 → 重新 provision 应用新角色；取消 → 停用影子账号（均保留数据）
+    const prevRoles = u.system_roles || {};
+    const results = {};
+    for (const s of access) {
+      if (prev.includes(s) && prevRoles[s] === cleanRoles[s]) continue;
+      try { await provisionToSystem(u, s, cleanRoles[s]); results[s] = prev.includes(s) ? 'role-updated' : 'ok'; }
+      catch (e) { results[s] = 'fail: ' + e.message; }
+    }
+    for (const s of prev) {
+      if (access.includes(s)) continue;
+      try { await syncActive({ ...u, system_access: [s] }, false); results[s] = 'revoked'; }
+      catch (e) { results[s] = 'revoke-fail: ' + e.message; }
+    }
+    return { ok: true, access, roles: cleanRoles, results };
   });
 
   // 停用
@@ -236,6 +301,10 @@ export function registerAdminRoutes(app, fastify) {
     if (me.id === String(req.params.id)) return reply.code(400).send(errorBody('不能停用当前登录的账号'));
     const r = await pool().query('UPDATE users SET active = false WHERE id = $1', [req.params.id]);
     if (r.rowCount === 0) return reply.code(404).send(errorBody('账号不存在'));
+    try {
+      const u = await getUserAccess(String(req.params.id));
+      if (u && (u.system_access || []).length) await syncActive(u, false);
+    } catch (e) { req.log.warn('跨系统停用同步失败: %s', e.message); }
     return { ok: true };
   });
 
@@ -244,6 +313,10 @@ export function registerAdminRoutes(app, fastify) {
     requireSuperAdmin(req, app);
     const r = await pool().query('UPDATE users SET active = true WHERE id = $1', [req.params.id]);
     if (r.rowCount === 0) return reply.code(404).send(errorBody('账号不存在'));
+    try {
+      const u = await getUserAccess(String(req.params.id));
+      if (u && (u.system_access || []).length) await syncActive(u, true);
+    } catch (e) { req.log.warn('跨系统启用同步失败: %s', e.message); }
     return { ok: true };
   });
 
@@ -258,6 +331,11 @@ export function registerAdminRoutes(app, fastify) {
       const c = await pool().query("SELECT COUNT(*)::int AS n FROM users WHERE role = 'superadmin'");
       if (c.rows[0].n <= 1) return reply.code(400).send(errorBody('不能删除最后一名超级管理员'));
     }
+    // 统一账号体系：删除前把各系统影子账号停用（保留对方业务数据，遵守数据红线）
+    try {
+      const u = await getUserAccess(id);
+      if (u && (u.system_access || []).length) await syncRemoved(u);
+    } catch (e) { req.log.warn('跨系统删除同步失败: %s', e.message); }
     const r = await pool().query('DELETE FROM users WHERE id = $1', [id]);
     if (r.rowCount === 0) return reply.code(404).send(errorBody('账号不存在'));
     return { ok: true };
