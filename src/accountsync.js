@@ -106,13 +106,27 @@ function getWmsPool() {
   return wmsPool;
 }
 
-// ---------- 确保 yj users 表有所需列（幂等，首次调用自动补） ----------
+// ---------- 确保 yj users 表有所需列 ----------
+// 部署时由 migrations 以 postgres 身份预执行；运行时这里仅作兜底：
+// 先查 information_schema，缺列才 ALTER；ALTER 因权限失败但列实际已存在（他人补建）也视为就绪
 let colsReady = false;
 export async function ensureCols() {
   if (colsReady) return;
-  await getPool('yj').query(`
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS system_access text[] NOT NULL DEFAULT '{}';
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS system_roles jsonb NOT NULL DEFAULT '{}'::jsonb;`);
+  const pool = getPool('yj');
+  const check = async () => {
+    const r = await pool.query(
+      `SELECT count(*)::int AS n FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='users' AND column_name IN ('system_access','system_roles')`);
+    return r.rows[0].n >= 2;
+  };
+  if (await check()) { colsReady = true; return; }
+  try {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS system_access text[] NOT NULL DEFAULT '{}';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS system_roles jsonb NOT NULL DEFAULT '{}'::jsonb;`);
+  } catch (e) {
+    if (!(await check())) throw e; // 确实没列且补不了 → 向上抛错
+  }
   colsReady = true;
 }
 
