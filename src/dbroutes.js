@@ -3,7 +3,7 @@ import { getPool, getFunctionSigs, resolveOverload } from './db.js';
 import { getAuthUser } from './auth.js';
 import { authorize, loadYjRole, isYjStaffRole } from './policies.js';
 import { isIdent } from './util.js';
-import { onRecordsStatusChange } from './xibao.js';
+import { onRecordsStatusChange, onRecordsCreated } from './xibao.js';
 
 const OPS = {
   eq: (c, p) => `${c} = ${p}`,
@@ -246,6 +246,11 @@ export function registerDbRoutes(fastify) {
         recordId: pickRecordId((r.rows && r.rows[0]) || cleanRows[0]),
         detail: { rows: cleanRows },
       });
+      /* 记录创建钩子（喜报登记即推）：仅 yj records，fire-and-forget，异常已在钩子内兜住。
+         前端 insert 带 .select() 时 r.rows 为 RETURNING * 的新行 */
+      if (app === 'yj' && table === 'records' && r.rows && r.rows.length) {
+        onRecordsCreated(app, req, r.rows).catch(() => {});
+      }
       return returning ? r.rows : null;
     } catch (e) {
       return { error: { message: e.message } };
