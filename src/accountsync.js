@@ -110,31 +110,54 @@ function getWmsPool() {
 // 部署时由 migrations 以 postgres 身份预执行；运行时这里仅作兜底：
 // 先查 information_schema，缺列才 ALTER；ALTER 因权限失败但列实际已存在（他人补建）也视为就绪
 let colsReady = false;
-export async function ensureCols() {
-  if (colsReady) return;
-  const pool = getPool('yj');
+const colsReadyByApp = new Set();
+
+export async function ensureCols(app = 'yj') {
+  if (app === 'yj') {
+    if (colsReady) return;
+    const pool = getPool('yj');
+    const check = async () => {
+      const r = await pool.query(
+        `SELECT count(*)::int AS n FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='users' AND column_name IN ('system_access','system_roles')`);
+      return r.rows[0].n >= 2;
+    };
+    if (await check()) { colsReady = true; return; }
+    try {
+      await pool.query(`
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS system_access text[] NOT NULL DEFAULT '{}';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS system_roles jsonb NOT NULL DEFAULT '{}'::jsonb;`);
+    } catch (e) {
+      if (!(await check())) throw e; // 确实没列且补不了 → 向上抛错
+    }
+    colsReady = true;
+    return;
+  }
+  // 其他应用：只需 avatar_data / avatar_updated_at 两列
+  if (colsReadyByApp.has(app)) return;
+  const pool = getPool(app);
   const check = async () => {
     const r = await pool.query(
       `SELECT count(*)::int AS n FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='users' AND column_name IN ('system_access','system_roles')`);
+        WHERE table_schema='public' AND table_name='users' AND column_name IN ('avatar_data','avatar_updated_at')`);
     return r.rows[0].n >= 2;
   };
-  if (await check()) { colsReady = true; return; }
+  if (await check()) { colsReadyByApp.add(app); return; }
   try {
     await pool.query(`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS system_access text[] NOT NULL DEFAULT '{}';
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS system_roles jsonb NOT NULL DEFAULT '{}'::jsonb;`);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data text;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_updated_at timestamptz;`);
   } catch (e) {
-    if (!(await check())) throw e; // 确实没列且补不了 → 向上抛错
+    if (!(await check())) throw e;
   }
-  colsReady = true;
+  colsReadyByApp.add(app);
 }
 
 /** 读用户（含开通信息与密码哈希，provision 用） */
 export async function getUserAccess(id) {
   await ensureCols();
   const r = await getPool('yj').query(
-    'SELECT id, phone, name, role, active, password_hash, system_access, system_roles FROM users WHERE id = $1', [id]);
+    'SELECT id, phone, name, role, active, password_hash, system_access, system_roles, avatar_data FROM users WHERE id = $1', [id]);
   return r.rows[0] || null;
 }
 
@@ -160,6 +183,14 @@ async function provisionQuan(user, role, active) {
      ON CONFLICT (owner_id) DO UPDATE SET role = EXCLUDED.role, active = EXCLUDED.active,
        name = EXCLUDED.name, phone = EXCLUDED.phone`,
     [quanId, user.phone, user.name, role, active]);
+  // 头像同步（若主库已有）
+  if (user.avatar_data) {
+    try {
+      await ensureCols('quan');
+      await getPool('quan').query(
+        'UPDATE users SET avatar_data = $1, avatar_updated_at = now() WHERE id = $2', [user.avatar_data, quanId]);
+    } catch (e) { logSyncErr('provision-avatar', 'quan', e); }
+  }
 }
 
 async function provisionWms(user, role, active) {
@@ -169,6 +200,10 @@ async function provisionWms(user, role, active) {
      ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash,
        display_name = EXCLUDED.display_name, role = EXCLUDED.role, is_active = EXCLUDED.is_active`,
     [user.phone, user.password_hash, user.name, role, active]);
+  if (user.avatar_data) {
+    try { await setAvatarWms(user.phone, user.avatar_data); }
+    catch (e) { logSyncErr('provision-avatar', 'wms', e); }
+  }
 }
 
 async function provisionZc(user, role, active) {
@@ -177,7 +212,11 @@ async function provisionZc(user, role, active) {
   const res = await fetch(cfg.baseUrl + '/api/internal/account-sync', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.key },
-    body: JSON.stringify({ action: 'upsert', phone: user.phone, name: user.name, password_hash: user.password_hash, role, active }),
+    body: JSON.stringify({
+      action: 'upsert', phone: user.phone, name: user.name,
+      password_hash: user.password_hash, role, active,
+      owner_id: user.id, avatar_data: user.avatar_data || null,
+    }),
     signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) throw new Error('zc 接口 ' + res.status);
@@ -246,4 +285,99 @@ export async function syncActive(user, active) {
 /** 删除工作台账号 → 各系统停用影子账号（不物理删除，保留业务数据归属） */
 export async function syncRemoved(user) {
   await syncActive(user, false);
+}
+
+/* ---------- 手机号变更 → 全系统联动 ----------
+   手机号是各系统的登录标识：
+     quan → users.phone + staff.phone
+     jz   → users.phone（jz 无登录体系，但仍保持一致）
+     wms  → users.username（username 即手机号）
+     zc   → 内部接口（username 即手机号）
+   注意：wms/zc 的 username 是唯一键，冲突时目标号已被占用则跳过并记录。
+*/
+export async function syncPhone(user, newPhone) {
+  await ensureCols();
+  const oldPhone = user.phone;
+  if (!newPhone || newPhone === oldPhone) return;
+
+  // ⚠️ 各系统的用户 id 各自生成（quan 用 genId、wms/zc 自增），**与 yj 主库 id 不同**，
+  //    因此一切跨系统更新都必须以「手机号」为匹配键，不能用 yj 的 id。
+
+  // quan（users.phone + staff.phone，均按 phone 匹配）
+  try {
+    await getPool('quan').query('UPDATE users SET phone = $1 WHERE phone = $2', [newPhone, oldPhone]);
+    await getPool('quan').query('UPDATE staff SET phone = $1 WHERE phone = $2', [newPhone, oldPhone]);
+  } catch (e) { logSyncErr('sync-phone', 'quan', e); }
+
+  // jz
+  try {
+    await getPool('jz').query('UPDATE users SET phone = $1 WHERE phone = $2', [newPhone, oldPhone]);
+  } catch (e) { logSyncErr('sync-phone', 'jz', e); }
+
+  // wms（username 即手机号；新号被占用则跳过）
+  try {
+    const dup = await getWmsPool().query('SELECT id FROM users WHERE username = $1 AND username <> $2', [newPhone, oldPhone]);
+    if (dup.rows.length) {
+      logSyncErr('sync-phone', 'wms', new Error('新手机号已被仓库系统其他账号占用'));
+    } else {
+      await getWmsPool().query('UPDATE users SET username = $1 WHERE username = $2', [newPhone, oldPhone]);
+    }
+  } catch (e) { logSyncErr('sync-phone', 'wms', e); }
+
+  // zc（内部接口）
+  try {
+    const cfg = resolveZcConfig();
+    if (!cfg) throw new Error('zc 同步未配置');
+    const res = await fetch(cfg.baseUrl + '/api/internal/account-sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.key },
+      body: JSON.stringify({ action: 'set-phone', phone: oldPhone, new_phone: newPhone }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error('zc 接口 ' + res.status);
+  } catch (e) { logSyncErr('sync-phone', 'zc', e); }
+}
+
+/* ---------- 头像变更 → 全系统联动 ----------
+   头像以 base64 PNG 存各系统 users.avatar_data，同步 = 复制一段文本，最可靠。
+*/
+export async function syncAvatar(user, avatarB64) {
+  await ensureCols();
+  const phone = user.phone;
+  for (const s of user.system_access || []) {
+    try {
+      if (s === 'quan' || s === 'jz') {
+        await ensureCols(s);
+        // 按 phone 匹配（各系统 id 与主库不同）
+        await getPool(s).query(
+          'UPDATE users SET avatar_data = $1, avatar_updated_at = now() WHERE phone = $2', [avatarB64, phone]);
+      } else if (s === 'wms') {
+        await setAvatarWms(phone, avatarB64);
+      } else if (s === 'zc') {
+        await setAvatarZc(phone, avatarB64);
+      }
+    } catch (e) { logSyncErr('sync-avatar', s, e); }
+  }
+}
+
+async function setAvatarWms(phone, avatarB64) {
+  const pool = getWmsPool();
+  await pool.query(
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data text;
+     ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_updated_at timestamptz`);
+  // wms 的 username 就是手机号
+  await pool.query(
+    'UPDATE users SET avatar_data = $1, avatar_updated_at = now() WHERE username = $2', [avatarB64, phone]);
+}
+
+async function setAvatarZc(phone, avatarB64) {
+  const cfg = resolveZcConfig();
+  if (!cfg) throw new Error('zc 同步未配置');
+  const res = await fetch(cfg.baseUrl + '/api/internal/account-sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.key },
+    body: JSON.stringify({ action: 'set-avatar', phone, avatar_data: avatarB64 }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error('zc 接口 ' + res.status);
 }

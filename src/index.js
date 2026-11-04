@@ -4,6 +4,7 @@ import multipart from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
 import { config, APPS } from './config.js';
 import { registerAuthRoutes, registerAdminRoutes } from './auth.js';
+import { registerProfileRoutes } from './profile.js';
 import { registerDbRoutes } from './dbroutes.js';
 import { registerStorageRoutes } from './storage.js';
 import { registerLlmRoutes } from './llm.js';
@@ -50,6 +51,9 @@ fastify.get('/api/health', async () => ({ ok: true }));
 // 认证：jz 不需要（注册/登录对 jz 返回 404）
 registerAuthRoutes('yj', fastify);
 registerAuthRoutes('quan', fastify);
+// 个人资料：头像上传 + 姓名/手机号修改（手机号变更全系统联动）
+registerProfileRoutes('yj', fastify);
+registerProfileRoutes('quan', fastify);
 // 账号管理（仅 yj）：列表/开通/停用/启用/删除/重置密码，超管专属
 registerAdminRoutes('yj', fastify);
 
