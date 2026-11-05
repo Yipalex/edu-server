@@ -24,7 +24,7 @@ export const SYNC_SYSTEMS = {
   },
   wms: {
     name: '仓库管理系统',
-    roles: [['operator', '操作员'], ['admin', '管理员'], ['superadmin', '超级管理员']],
+    roles: [['teacher', '教师（仅本校区出入库）'], ['operator', '操作员'], ['admin', '管理员'], ['superadmin', '超级管理员']],
   },
   zc: {
     name: '固定资产管理',
@@ -37,7 +37,7 @@ export const DEFAULT_ROLE_MAP = {
   superadmin: { quan: 'superadmin', wms: 'superadmin', zc: 'superadmin' },
   principal:  { quan: 'admin', wms: 'admin', zc: 'principal' },
   finance:    { quan: 'teacher', wms: 'operator', zc: 'finance' },
-  teacher:    { quan: 'teacher', wms: 'operator', zc: 'teacher' },
+  teacher:    { quan: 'teacher', wms: 'teacher', zc: 'teacher' },
 };
 
 // ---------- zc（固定资产，SQLite 独立容器）HTTP 内部接口配置 ----------
@@ -106,6 +106,13 @@ function getWmsPool() {
   return wmsPool;
 }
 
+/** 工作台「系统权限」弹窗用：读取 WMS 校区/库位列表（只读） */
+export async function listWmsLocations() {
+  const r = await getWmsPool().query(
+    'SELECT id, name, code, type FROM locations WHERE is_active = true ORDER BY sort_order, id');
+  return r.rows;
+}
+
 // ---------- 确保 yj users 表有所需列 ----------
 // 部署时由 migrations 以 postgres 身份预执行；运行时这里仅作兜底：
 // 先查 information_schema，缺列才 ALTER；ALTER 因权限失败但列实际已存在（他人补建）也视为就绪
@@ -119,14 +126,15 @@ export async function ensureCols(app = 'yj') {
     const check = async () => {
       const r = await pool.query(
         `SELECT count(*)::int AS n FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='users' AND column_name IN ('system_access','system_roles')`);
-      return r.rows[0].n >= 2;
+          WHERE table_schema='public' AND table_name='users' AND column_name IN ('system_access','system_roles','system_campuses')`);
+      return r.rows[0].n >= 3;
     };
     if (await check()) { colsReady = true; return; }
     try {
       await pool.query(`
         ALTER TABLE users ADD COLUMN IF NOT EXISTS system_access text[] NOT NULL DEFAULT '{}';
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS system_roles jsonb NOT NULL DEFAULT '{}'::jsonb;`);
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS system_roles jsonb NOT NULL DEFAULT '{}'::jsonb;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS system_campuses jsonb NOT NULL DEFAULT '{}'::jsonb;`);
     } catch (e) {
       if (!(await check())) throw e; // 确实没列且补不了 → 向上抛错
     }
@@ -157,7 +165,7 @@ export async function ensureCols(app = 'yj') {
 export async function getUserAccess(id) {
   await ensureCols();
   const r = await getPool('yj').query(
-    'SELECT id, phone, name, role, active, password_hash, system_access, system_roles, avatar_data FROM users WHERE id = $1', [id]);
+    'SELECT id, phone, name, role, active, password_hash, system_access, system_roles, system_campuses, avatar_data FROM users WHERE id = $1', [id]);
   return r.rows[0] || null;
 }
 
@@ -193,13 +201,20 @@ async function provisionQuan(user, role, active) {
   }
 }
 
-async function provisionWms(user, role, active) {
+async function provisionWms(user, role, active, campusLocationId) {
   await getWmsPool().query(
     `INSERT INTO users (username, password_hash, display_name, role, is_active)
      VALUES ($1,$2,$3,$4,$5)
      ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash,
        display_name = EXCLUDED.display_name, role = EXCLUDED.role, is_active = EXCLUDED.is_active`,
     [user.phone, user.password_hash, user.name, role, active]);
+  // 教师角色：绑定所属校区（wms users.home_location_id）；校验库位真实存在
+  if (campusLocationId != null) {
+    const loc = await getWmsPool().query('SELECT id FROM locations WHERE id = $1', [campusLocationId]);
+    if (!loc.rows[0]) throw new Error('仓库系统校区不存在（id=' + campusLocationId + '）');
+    await getWmsPool().query(
+      'UPDATE users SET home_location_id = $1 WHERE username = $2', [campusLocationId, user.phone]);
+  }
   if (user.avatar_data) {
     try { await setAvatarWms(user.phone, user.avatar_data); }
     catch (e) { logSyncErr('provision-avatar', 'wms', e); }
@@ -253,9 +268,9 @@ function logSyncErr(what, system, err) {
 // ---------- 对外动作（全部 best-effort：单个系统失败不拖垮整体） ----------
 
 /** 向指定系统开通影子账号（幂等，可重复调用） */
-export async function provisionToSystem(user, system, role) {
+export async function provisionToSystem(user, system, role, campusLocationId) {
   await ensureCols();
-  try { await PROVISIONERS[system](user, role, user.active !== false); }
+  try { await PROVISIONERS[system](user, role, user.active !== false, campusLocationId); }
   catch (e) { logSyncErr('provision', system, e); throw e; }
 }
 

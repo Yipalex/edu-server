@@ -5,7 +5,7 @@ import jwt from 'jsonwebtoken';
 import { config } from './config.js';
 import { getPool } from './db.js';
 import { genId, isPhone, errorBody, HttpError } from './util.js';
-import { ensureCols, getUserAccess, provisionToSystem, syncPasswordHash, syncActive, syncRemoved, SYNC_SYSTEMS, DEFAULT_ROLE_MAP } from './accountsync.js';
+import { ensureCols, getUserAccess, provisionToSystem, syncPasswordHash, syncActive, syncRemoved, SYNC_SYSTEMS, DEFAULT_ROLE_MAP, listWmsLocations } from './accountsync.js';
 
 export function signToken(user, app) {
   return jwt.sign({ sub: user.id, phone: user.phone, role: user.role || 'user', app }, config.jwtSecret, {
@@ -252,16 +252,24 @@ export function registerAdminRoutes(app, fastify) {
     return {
       access: u.system_access || [],
       roles: u.system_roles || {},
+      campuses: u.system_campuses || {},
       defaults: DEFAULT_ROLE_MAP[u.role] || DEFAULT_ROLE_MAP.teacher,
       systems: SYNC_SYSTEMS,
     };
+  });
+
+  // WMS 校区/库位列表（「系统权限」弹窗给教师角色选校区用；WMS 未配置时返回空数组）
+  fastify.get(`/api/${app}/admin/wms-locations`, async (req, reply) => {
+    requireSuperAdmin(req, app);
+    try { return { locations: await listWmsLocations() }; }
+    catch { return { locations: [] }; }
   });
 
   // 设置某账号可访问的系统与各系统角色（勾选即开通影子账号，取消即停用，均不删数据）
   fastify.put(`/api/${app}/admin/users/:id/access`, async (req, reply) => {
     requireSuperAdmin(req, app);
     const id = String(req.params.id);
-    const { access, roles } = req.body || {};
+    const { access, roles, campuses } = req.body || {};
     if (!Array.isArray(access)) return reply.code(400).send(errorBody('access 必须是数组'));
     const bad = access.filter((s) => !SYNC_SYSTEMS[s]);
     if (bad.length) return reply.code(400).send(errorBody('未知系统: ' + bad.join(',')));
@@ -275,16 +283,23 @@ export function registerAdminRoutes(app, fastify) {
     if (!u) return reply.code(404).send(errorBody('账号不存在'));
 
     const prev = u.system_access || [];
+    const cleanCampuses = {};
+    for (const s of access) {
+      const c = campuses?.[s];
+      if (c != null && Number.isInteger(Number(c))) cleanCampuses[s] = Number(c);
+    }
     await pool().query(
-      'UPDATE users SET system_access = $1, system_roles = $2 WHERE id = $3',
-      [access, JSON.stringify(cleanRoles), id]);
+      'UPDATE users SET system_access = $1, system_roles = $2, system_campuses = $3 WHERE id = $4',
+      [access, JSON.stringify(cleanRoles), JSON.stringify(cleanCampuses), id]);
 
     // 新开通 → provision；角色变化 → 重新 provision 应用新角色；取消 → 停用影子账号（均保留数据）
     const prevRoles = u.system_roles || {};
     const results = {};
     for (const s of access) {
-      if (prev.includes(s) && prevRoles[s] === cleanRoles[s]) continue;
-      try { await provisionToSystem(u, s, cleanRoles[s]); results[s] = prev.includes(s) ? 'role-updated' : 'ok'; }
+      // 校区变化也要重新 provision（教师角色的 home_location_id 绑定）
+      const campusChanged = (u.system_campuses || {})[s] !== cleanCampuses[s];
+      if (prev.includes(s) && prevRoles[s] === cleanRoles[s] && !campusChanged) continue;
+      try { await provisionToSystem(u, s, cleanRoles[s], cleanCampuses[s]); results[s] = prev.includes(s) ? 'role-updated' : 'ok'; }
       catch (e) { results[s] = 'fail: ' + e.message; }
     }
     for (const s of prev) {
@@ -292,7 +307,7 @@ export function registerAdminRoutes(app, fastify) {
       try { await syncActive({ ...u, system_access: [s] }, false); results[s] = 'revoked'; }
       catch (e) { results[s] = 'revoke-fail: ' + e.message; }
     }
-    return { ok: true, access, roles: cleanRoles, results };
+    return { ok: true, access, roles: cleanRoles, campuses: cleanCampuses, results };
   });
 
   // 停用
